@@ -13,7 +13,19 @@ extras_datas, extras_binaries, extras_hidden = collect_all("litellm_proxy_extras
 enterprise_datas, enterprise_binaries, enterprise_hidden = collect_all("litellm_enterprise")
 tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hidden = collect_all("tiktoken_ext")
 
-datas = litellm_datas + extras_datas + enterprise_datas + tiktoken_ext_datas
+EXCLUDED_DATAS = ("tests", "goldens", "fixtures", "__pycache__", ".git", "docs")
+EXCLUDED_EXTS = (".md", ".txt", ".jsonl", ".lock", ".bak")
+
+def _keep_data(src, dst):
+    normalized = src.replace("\\", "/")
+    segments = normalized.split("/")
+    if any(part in segments for part in EXCLUDED_DATAS):
+        return False
+    if src.lower().endswith(EXCLUDED_EXTS):
+        return False
+    return True
+
+datas = [(s, d) for s, d in litellm_datas + extras_datas + enterprise_datas + tiktoken_ext_datas if _keep_data(s, d)]
 binaries = litellm_binaries + extras_binaries + enterprise_binaries + tiktoken_ext_binaries
 hiddenimports = (
     litellm_hidden
@@ -33,7 +45,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[os.path.join(os.path.dirname(os.path.abspath(SPEC)), "utf8_runtime_hook.py")],
-    excludes=["torch", "tensorflow", "matplotlib", "pandas", "scipy"],
+    excludes=[
+        "torch", "tensorflow", "matplotlib", "pandas", "scipy",
+        "polars", "soundfile", "ldap3", "gunicorn", "granian", "uvloop",
+        "azure.identity", "azure.storage.blob", "boto3", "pyroscope",
+        "grpc", "grpcio",
+        "onnxruntime", "librosa", "soundfile", "pytest", "mutmut", "mypy",
+    ],
     noarchive=False,
     optimize=0,
 )
