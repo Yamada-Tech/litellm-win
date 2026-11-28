@@ -1,11 +1,13 @@
 # LiteLLM Proxy Windows 実行パッケージ
 
 `LiteLLMTray.exe` をダブルクリックするだけで、Windows 11 / 10 の上に LiteLLM Proxy が立ち上がる配布物です。
-Python、venv、Docker、WSL は不要です。GUI でモデルと API キーを設定でき、閉じるボタンでトレイに収納され、
-Windows 起動時に自動実行もできます。
+GUI でモデルと API キーを設定でき、閉じるボタンでトレイに収納され、Windows 起動時に自動実行もできます。
 
-本リポジトリは https://github.com/BerriAI/litellm を元にしており、exe に Proxy 本体を同梱するための
-最小構成に整理しています。upstream のオリジナルドキュメントは [README_org.md](README_org.md) に残してあります。
+exe には LiteLLM Proxy 本体は同梱されていません。初回起動時に実行フォルダへ `.venv` を作り、PyPI から `litellm[proxy]` をインストールして Proxy を起動します。
+実行フォルダに `.venv` が既にある場合はそれを使い、再インストールはしません。
+
+本リポジトリは https://github.com/BerriAI/litellm を元にしており、exe のソースとビルド設定だけを持つ最小構成に整理しています。
+upstream のオリジナルドキュメントは [README_org.md](README_org.md) に残してあります。
 
 ## 動かし方
 
@@ -14,7 +16,8 @@ GUI に入力した内容が書き込まれるファイルです。
 
 1. `LiteLLMTray.exe` を手に入れます。ビルド済みの exe を配布してもらうか、自分でビルドします
 2. `LiteLLMTray.exe` を実行します。`litellm.config` が無ければ exe と同じフォルダに作られます
-3. ウィンドウでマスターキーとモデルを入力して「保存して起動」を押します。終了時も保存されます
+3. 初回は venv 構築と `litellm[proxy]` のインストールを行います。インターネット接続と Python が必要です
+4. ウィンドウでマスターキーとモデルを入力して「保存して起動」を押します。終了時も保存されます
 
 ビルドが必要な場合だけ Python と Rust を使います。
 
@@ -24,9 +27,8 @@ python -m venv .venv
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --distpath . windows_launcher\LiteLLMTray.spec
 ```
 
-Rust のツールチェーンが見つからないエラーが出たら https://rustup.rs を一度実行してください。
-出来上がった exe は 260 MB 前後あり、GitHub に載せると大きすぎるため git には入れていません。
-exe 1 本と README だけを配布すれば、ビルド環境のない人にも配れます。
+出来上がった exe は pystray と PIL のみを同梱するため 15 MB 前後です。Proxy 本体の約 200 MB は exe には入らず、
+初回起動時に `.venv` として実行フォルダへ展開されます。
 
 古い `config.yaml` と `litellm-windows.yaml` が同じフォルダにある場合は、初回起動時に
 `litellm.config` へ自動で引っ越します。`config.yaml` の `os.environ/GEMINI_API_KEY_1` のような
@@ -37,10 +39,10 @@ exe 1 本と README だけを配布すれば、ビルド環境のない人にも
 | 項目 | 内容 |
 | --- | --- |
 | バインド | `127.0.0.1` は自分だけ、`0.0.0.0` は LAN 全体からアクセス可能 |
-| ポート | 既定は 4000。他 PC の Docker 版と同じ 4000 が既定値です |
+| ポート | 既定は 4000 |
 | マスターキー | Proxy 自体を守るキー。未設定でも起動しますが、警告ダイアログが出ます |
 | モデルを追加 | プロバイダと API キーを入れると「モデル一覧を取得」で使えるモデルを一覧から選べます |
-| openai 互換ローカル | LM Studio、Ollama、vLLM などを URL で追加します。`http://127.0.0.1:1234/v1` のように入れるとそのサーバーのモデル一覧が取れます。鍵を要求しないサーバーは API キーを空にできます |
+| openai 互換ローカル | LM Studio、Ollama、vLLM などを URL で追加します。鍵を要求しないサーバーは API キーを空にできます |
 | 保存して起動 | 設定を `litellm.config` に書き出して Proxy を起動し、正常起動完了まで待ちます |
 | 停止 | 起動中の Proxy とその子プロセスを止めます |
 
@@ -81,15 +83,14 @@ push はされませんが、共有フォルダやバックアップに置く場
 
 ## Windows 起動時の自動実行
 
-GUI の「Windows 起動時に自動実行」にチェックを入れると、ログオン時に同じ exe が `--headless` で起動します。
+GUI の「Windows 起動時に自動実行」にチェックを入れると、ログオン時に venv 内 Python が `--headless` で起動します。
 `--headless` は GUI を開かず、`litellm.config` に保存された設定でそのまま Proxy を立ち上げます。
-登録は現在のユーザーのログオン時に限定され、コントロールパネルのスタートアップ項目から消せます。
+登録は現在のユーザーのログオン時に限定されます。
 
 ## exe を再ビルドする場合
 
-`windows_launcher\LiteLLMTray.spec` が litellm 本体、依存パッケージ、tiktoken のエンコーディング定義を
-集める設定になっています。コマンドは「動かし方」のビルド手順と同じで、生成される exe は 260 MB 前後です。
-同じフォルダに古い exe があると上書きされます。
+`windows_launcher\LiteLLMTray.spec` は pystray と PIL のみを集める設定です。Proxy 本体は exe に入れず、
+初回起動時に venv として展開されます。コマンドは「動かし方」のビルド手順と同じです。
 
 ## よくある質問
 
@@ -110,10 +111,16 @@ GUI の「Windows 起動時に自動実行」にチェックを入れると、�
 `cooldown_time`、エラー種別ごとのクールダウン条件 (`allowed_fails_policy`) は
 `litellm.config` の `router_settings` で調整できます
 
+初回起動で失敗する
+: `litellm[proxy]` のインストールにはインターネット接続と Python が必要です。`.venv` が壊れている場合は
+`.venv` と `.litellm-ready` を削除して再起動してください
+
 ## 構成
 
 ```
-LiteLLMTray.exe              実行ファイル (Proxy 本体と依存を同梱)
+LiteLLMTray.exe              実行ファイル (pystray/PIL のみ同梱、Proxy 本体は exe に含まない)
+.venv/                       初回起動時に作られる実行環境 (litellm[proxy] 等)
+.litellm-ready               venv 構築完了マーカー
 litellm.config               実行時に作られる設定 (バインド、ポート、マスターキー、モデル一覧)
 litellm.log                  起動履歴と Proxy のログ
 config.yaml                  初期モデル定義 (exe と同じフォルダに置くと litellm.config へ取り込む)
