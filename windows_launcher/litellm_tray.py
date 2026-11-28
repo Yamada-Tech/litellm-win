@@ -1,7 +1,8 @@
 """Windows 用の LiteLLM Proxy ランチャー。
 
 設定 GUI とシステムトレイを提供し、`litellm.config` 1 枚に設定を集約して Proxy を起動する。
-Proxy 本体は exe に同梱されており、自分自身を `--proxy-internal` で再起動する形で起動する。
+exe には Proxy 本体を同梱しない。実行フォルダに `.venv` が無ければこれを作り、
+PyPI から `litellm[proxy]` をインストールして、そこへ起動する。
 """
 
 from __future__ import annotations
@@ -40,11 +41,55 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def venv_dir() -> Path:
+    return app_dir() / ".venv"
+
+
+def venv_python() -> Path:
+    if os.name == "nt":
+        return venv_dir() / "Scripts" / "python.exe"
+    return venv_dir() / "bin" / "python"
+
+
+def ensure_venv() -> Path:
+    """実行フォルダに venv と litellm[proxy] が無ければ構築する。構築済みならそのまま返す。"""
+    python = venv_python()
+    marker = venv_dir() / ".litellm-ready"
+    if marker.is_file() and python.is_file():
+        return python
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if not python.is_file():
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir())],
+            check=True,
+            creationflags=flags,
+        )
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "--upgrade", "pip"],
+        check=True,
+        creationflags=flags,
+    )
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "litellm[proxy]"],
+        check=True,
+        creationflags=flags,
+    )
+    marker.write_text("ok", encoding="utf-8")
+    return python
+
+
 def self_command() -> tuple[str, ...]:
-    """自分自身をもう一度起動するときのファイル名のかたち。"""
-    if getattr(sys, "frozen", False):
-        return (sys.executable,)
-    return (sys.executable, str(Path(__file__).resolve()))
+    """venv 内の python を呼ぶ。"""
+    return (str(ensure_venv()),)
+
+
+def venv_error_message(error: BaseException) -> str:
+    """venv 構築に失敗したときの画面表示用文字列。"""
+    if isinstance(error, subprocess.CalledProcessError):
+        return f"実行環境の構築に失敗しました (exit code {error.returncode})。インターネット接続と Python を確認してください。"
+    if isinstance(error, OSError):
+        return f"実行環境の構築に失敗しました: {error}"
+    return f"実行環境の構築に失敗しました: {type(error).__name__}: {error}"
 
 
 def ensure_config(base: Path) -> Path:
@@ -309,9 +354,13 @@ class ProxyProcess:
             # 未設定だと Proxy 本体が起動を拒否するので、upstream 公式の escape hatch で通す
             env[WEAK_MASTER_KEY_ENV_VAR] = "true"
         env.update(load_dotenv_files((app_dir(),)))
+        try:
+            python = self_command()
+        except (subprocess.CalledProcessError, OSError) as error:
+            raise RuntimeError(venv_error_message(error)) from error
         command = [
-            *self_command(),
-            "--proxy-internal",
+            *python,
+            "-m", "litellm.proxy.proxy_cli",
             "--config",
             str(config),
             "--host",
@@ -598,7 +647,7 @@ class Launcher:
         set_autostart(self.autostart.get())
         try:
             self.process.start(self.config_path, settings, self.log_path)
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             messagebox.showerror("起動失敗", str(error))
             return
         self.status.set(f"起動中 http://{settings.host}:{settings.port}/  ログ: {LOG_NAME}")
@@ -678,25 +727,10 @@ def run_headless() -> int:
     return 0
 
 
-def run_bundled_proxy() -> None:
-    if not getattr(sys, "frozen", False):
-        sys.path.insert(0, str(app_dir()))
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    sys.argv = [sys.argv[0]] + [arg for arg in sys.argv[1:] if arg != "--proxy-internal"]
-    from litellm.proxy.proxy_cli import run_server
-
-    run_server()
-
-
 def main() -> int:
     import multiprocessing
 
     multiprocessing.freeze_support()
-    if "--proxy-internal" in sys.argv:
-        run_bundled_proxy()
-        return 0
     parser = argparse.ArgumentParser(description="LiteLLM Proxy Windows ランチャー")
     parser.add_argument("--headless", action="store_true", help="GUI なしで保存済み設定を使い起動する")
     args: Final = parser.parse_args()
