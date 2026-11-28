@@ -185,7 +185,7 @@ class ConfigFileTest(unittest.TestCase):
         log_path = self.base / "litellm.log"
         log_path.write_text("earlier line\n", encoding="utf-8")
 
-        tray.append_log_line(log_path, tray.unauthenticated_warning("0.0.0.0"))
+        tray.append_log_line(log_path, tray.unauthenticated_warning("0.0.0.0", "ja"))
 
         lines = log_path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines[0], "earlier line")
@@ -193,8 +193,8 @@ class ConfigFileTest(unittest.TestCase):
         self.assertEqual(len(lines), 2)
 
     def test_warning_names_the_bind_and_never_blocks_start(self) -> None:
-        loopback = tray.unauthenticated_warning("127.0.0.1")
-        wide = tray.unauthenticated_warning("0.0.0.0")
+        loopback = tray.unauthenticated_warning("127.0.0.1", "ja")
+        wide = tray.unauthenticated_warning("0.0.0.0", "ja")
         for message in (loopback, wide):
             self.assertIn("マスターキー", message)
             self.assertIn("ネットワーク外に公開", message)

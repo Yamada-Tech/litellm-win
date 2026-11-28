@@ -23,6 +23,8 @@ from typing import Final
 from urllib import request
 from urllib.parse import urlparse
 
+from i18n import LANGUAGES, DEFAULT_LANGUAGE, t
+
 HOST_CHOICES: Final = ("127.0.0.1", "0.0.0.0")
 CONFIG_NAME: Final = "litellm.config"
 LEGACY_CONFIG_NAME: Final = "config.yaml"
@@ -30,9 +32,13 @@ LEGACY_SETTINGS_NAME: Final = "litellm-windows.yaml"
 LOG_NAME: Final = "litellm.log"
 MASTER_KEY_ENV_VAR: Final = "LITELLM_MASTER_KEY"
 WEAK_MASTER_KEY_ENV_VAR: Final = "LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY"
-DEFAULT_SETTINGS: Final = MappingProxyType({"host": "127.0.0.1", "port": 4000, "master_key": ""})
+DEFAULT_SETTINGS: Final = MappingProxyType({"host": "127.0.0.1", "port": 4000, "master_key": "", "language": DEFAULT_LANGUAGE})
 STARTUP_KEY: Final = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE: Final = "LiteLLMProxyTray"
+
+LOCAL_PROVIDER: Final = "local"
+PROVIDERS: Final = ("gemini", "openai", "anthropic", LOCAL_PROVIDER, "other")
+NO_KEY_PLACEHOLDER: Final = "not-needed"
 
 
 def app_dir() -> Path:
@@ -52,7 +58,6 @@ def venv_python() -> Path:
 
 
 def ensure_venv() -> Path:
-    """実行フォルダに venv と litellm[proxy] が無ければ構築する。構築済みならそのまま返す。"""
     python = venv_python()
     marker = venv_dir() / ".litellm-ready"
     if marker.is_file() and python.is_file():
@@ -79,21 +84,18 @@ def ensure_venv() -> Path:
 
 
 def self_command() -> tuple[str, ...]:
-    """venv 内の python を呼ぶ。"""
     return (str(ensure_venv()),)
 
 
-def venv_error_message(error: BaseException) -> str:
-    """venv 構築に失敗したときの画面表示用文字列。"""
+def venv_error_message(error: BaseException, lang: str) -> str:
     if isinstance(error, subprocess.CalledProcessError):
-        return f"実行環境の構築に失敗しました (exit code {error.returncode})。インターネット接続と Python を確認してください。"
+        return t("venv_build_failed", lang, code=error.returncode)
     if isinstance(error, OSError):
-        return f"実行環境の構築に失敗しました: {error}"
-    return f"実行環境の構築に失敗しました: {type(error).__name__}: {error}"
+        return t("venv_build_failed_generic", lang, error=error)
+    return t("venv_build_failed_generic", lang, error=f"{type(error).__name__}: {error}")
 
 
 def ensure_config(base: Path) -> Path:
-    """設定ファイルが無ければ実行フォルダに作る。"""
     path = base / CONFIG_NAME
     if not path.is_file():
         dump_yaml(path, initial_config(base))
@@ -105,7 +107,6 @@ def initial_config(base: Path) -> dict[str, object]:
 
 
 def legacy_config(base: Path) -> dict[str, object]:
-    """旧 config.yaml / .env / litellm-windows.yaml の設定を 1 枚にまとめる。"""
     legacy = base / LEGACY_CONFIG_NAME
     if not legacy.is_file():
         return {}
@@ -125,17 +126,15 @@ def legacy_config(base: Path) -> dict[str, object]:
 
 
 def resolve_api_key(value: str, env_values: Mapping[str, str]) -> str:
-    """os.environ/ 参照を .env の実値に置き換える。見つからなければ参照を残す。"""
     name: Final = value.removeprefix("os.environ/")
     if name == value:
         return value
     return env_values.get(name, value)
 
 
-def local_deployment(model_name: str, provider_model: str, api_key: str, base_url: str) -> Deployment:
-    """OpenAI 互換のローカルサーバー 1 本を作る。鍵を要求しないサーバーは placeholder を入れる。"""
+def local_deployment(model_name: str, provider_model: str, api_key: str, base_url: str, lang: str = DEFAULT_LANGUAGE) -> Deployment:
     model = provider_model if provider_model.startswith("openai/") else f"openai/{provider_model}"
-    return Deployment(model_name, model, api_key or NO_KEY_PLACEHOLDER, normalize_openai_compatible_base(base_url))
+    return Deployment(model_name, model, api_key or NO_KEY_PLACEHOLDER, normalize_openai_compatible_base(base_url, lang))
 
 
 def resolve_api_key_in(row: Deployment, env_values: Mapping[str, str]) -> Deployment:
@@ -166,19 +165,24 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 4000
     master_key: str = ""
+    language: str = DEFAULT_LANGUAGE
 
     @staticmethod
     def load(config_path: Path) -> "Settings":
         raw: Final = load_yaml(config_path)
+        lang: Final = str(raw.get("language", DEFAULT_LANGUAGE))
+        if lang not in LANGUAGES:
+            lang = DEFAULT_LANGUAGE
         return Settings(
             host=str(raw.get("host", "127.0.0.1")),
             port=int(raw.get("port", 4000)),
             master_key=str(raw.get("master_key", "")),
+            language=lang,
         )
 
     def save(self, config_path: Path) -> None:
         data = load_yaml(config_path)
-        data.update({"host": self.host, "port": self.port, "master_key": self.master_key})
+        data.update({"host": self.host, "port": self.port, "master_key": self.master_key, "language": self.language})
         dump_yaml(config_path, data)
 
 
@@ -267,17 +271,12 @@ def health_ok(port: int) -> bool:
 
 GEMINI_MODELS_URL: Final = "https://generativelanguage.googleapis.com/v1beta/models"
 OPENAI_MODELS_URL: Final = "https://api.openai.com/v1/models"
-LOCAL_PROVIDER: Final = "openai 互換ローカル"
-PROVIDERS: Final = ("gemini", "openai", "anthropic", LOCAL_PROVIDER, "その他")
-# ローカル推論サーバーは鍵を検証しないが、OpenAI SDK は空の Bearer ヘッダを拒否する
-NO_KEY_PLACEHOLDER: Final = "not-needed"
 
 
-def normalize_openai_compatible_base(value: str) -> str:
-    """OpenAI 互換サーバーのベース URL を `<host>/v1` の形に揃える。"""
+def normalize_openai_compatible_base(value: str, lang: str = DEFAULT_LANGUAGE) -> str:
     parsed = urlparse(value.strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("URL は http:// または https:// で入力してください")
+        raise ValueError(t("error_url_scheme", lang))
     segments = parsed.path.split("/")
     if "v1" in segments:
         path = "/".join(segments[: segments.index("v1") + 1])
@@ -286,14 +285,9 @@ def normalize_openai_compatible_base(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{path}"
 
 
-def unauthenticated_warning(host: str) -> str:
-    """マスターキー無しで起動する后果を、起動を止めずに伝える。"""
-    reach: Final = "LAN 全体からアクセスできる状態です" if host == "0.0.0.0" else "アクセスは自分だけになります"
-    return (
-        "マスターキーが未設定のまま起動します。未設定の LiteLLM は認証なしで要求を通すため、"
-        f"誰でもアクセス可能となります。ネットワーク外に公開しないでください。"
-        f"現在のバインド {host} では {reach}。"
-    )
+def unauthenticated_warning(host: str, lang: str = DEFAULT_LANGUAGE) -> str:
+    reach: Final = "reach_wide" if host == "0.0.0.0" else "reach_loopback"
+    return t("unauth_warning", lang, host=host, reach=t(reach, lang))
 
 
 def load_dotenv_files(search_dirs: tuple[Path, ...]) -> dict[str, str]:
@@ -311,7 +305,7 @@ def load_dotenv_files(search_dirs: tuple[Path, ...]) -> dict[str, str]:
     return values
 
 
-def fetch_provider_models(provider: str, api_key: str, base_url: str = "") -> tuple[str, ...]:
+def fetch_provider_models(provider: str, api_key: str, base_url: str = "", lang: str = DEFAULT_LANGUAGE) -> tuple[str, ...]:
     if provider == "gemini":
         url = f"{GEMINI_MODELS_URL}?key={api_key}&pageSize=200"
         with request.urlopen(url, timeout=30) as response:
@@ -322,15 +316,23 @@ def fetch_provider_models(provider: str, api_key: str, base_url: str = "") -> tu
             if "generateContent" in " ".join(m.get("supportedGenerationMethods", []))
         )
     if provider in ("openai", LOCAL_PROVIDER):
-        base = normalize_openai_compatible_base(base_url) if provider == LOCAL_PROVIDER else OPENAI_MODELS_URL
+        base = normalize_openai_compatible_base(base_url, lang) if provider == LOCAL_PROVIDER else OPENAI_MODELS_URL
         models_url = base if base.endswith("/models") else f"{base}/models"
         req = request.Request(models_url, headers={"Authorization": f"Bearer {api_key or NO_KEY_PLACEHOLDER}"})
         with request.urlopen(req, timeout=30) as response:
             data = json.loads(response.read())
         return tuple(f"openai/{m['id']}" for m in data.get("data", []))
     if provider == "anthropic":
-        raise ValueError("Anthropic はモデル一覧 API を提供していません。モデル名を手入力してください")
-    raise ValueError("このプロバイダの一覧取得は未対応です。モデル名を手入力してください")
+        raise ValueError(t("anthropic_unsupported", lang))
+    raise ValueError(t("fetch_unsupported", lang))
+
+
+def provider_display_name(provider: str, lang: str) -> str:
+    if provider == LOCAL_PROVIDER:
+        return "OpenAI-compatible local" if lang == "en" else "openai 互換ローカル"
+    if provider == "other":
+        return "Other" if lang == "en" else "その他"
+    return provider
 
 
 class ProxyProcess:
@@ -351,13 +353,12 @@ class ProxyProcess:
         if settings.master_key:
             env[MASTER_KEY_ENV_VAR] = settings.master_key
         else:
-            # 未設定だと Proxy 本体が起動を拒否するので、upstream 公式の escape hatch で通す
             env[WEAK_MASTER_KEY_ENV_VAR] = "true"
         env.update(load_dotenv_files((app_dir(),)))
         try:
             python = self_command()
         except (subprocess.CalledProcessError, OSError) as error:
-            raise RuntimeError(venv_error_message(error)) from error
+            raise RuntimeError(venv_error_message(error, settings.language)) from error
         command = [
             *python,
             "-m", "litellm.proxy.proxy_cli",
@@ -399,67 +400,83 @@ class Launcher:
         self.log_path: Final = self.dir / LOG_NAME
         self.config_path: Final = ensure_config(self.dir)
         settings: Final = Settings.load(self.config_path)
+        self.lang: Final = settings.language
         self.process = ProxyProcess()
         self.tray = None
         self.root = tk.Tk()
-        self.root.title("LiteLLM Proxy")
+        self.root.title(t("app_title", self.lang))
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         self.host = tk.StringVar(value=settings.host)
         self.port = tk.StringVar(value=str(settings.port))
         self.master_key = tk.StringVar(value=settings.master_key)
+        self.language = tk.StringVar(value=settings.language)
         self.autostart = tk.BooleanVar(value=autostart_enabled())
-        self.status = tk.StringVar(value="停止中")
+        self.status = tk.StringVar(value=t("status_stopped", self.lang))
         self._build_form()
         self._refresh_rows()
 
     def _build_form(self) -> None:
+        lang = self.lang
         frame = ttk.Frame(self.root, padding=12)
         frame.grid(sticky="nsew")
 
         grid = ttk.Frame(frame)
         grid.grid(row=0, column=0, sticky="w")
-        ttk.Label(grid, text="バインド").grid(row=0, column=0, sticky="w")
+        ttk.Label(grid, text=t("label_host", lang)).grid(row=0, column=0, sticky="w")
         ttk.Combobox(grid, textvariable=self.host, values=HOST_CHOICES, width=14).grid(row=0, column=1, sticky="w")
-        ttk.Label(grid, text="ポート").grid(row=1, column=0, sticky="w")
+        ttk.Label(grid, text=t("label_port", lang)).grid(row=1, column=0, sticky="w")
         ttk.Entry(grid, textvariable=self.port, width=16).grid(row=1, column=1, sticky="w")
-        ttk.Label(grid, text="マスターキー").grid(row=2, column=0, sticky="w")
+        ttk.Label(grid, text=t("label_master_key", lang)).grid(row=2, column=0, sticky="w")
         ttk.Entry(grid, textvariable=self.master_key, width=34, show="*").grid(row=2, column=1, sticky="w")
-        ttk.Checkbutton(grid, text="Windows 起動時に自動実行", variable=self.autostart).grid(
-            row=3, column=0, columnspan=2, sticky="w"
+        ttk.Label(grid, text=t("language_label", lang)).grid(row=3, column=0, sticky="w")
+        lang_box = ttk.Combobox(grid, textvariable=self.language, values=LANGUAGES, width=14, state="readonly")
+        lang_box.grid(row=3, column=1, sticky="w")
+        lang_box.bind("<<ComboboxSelected>>", lambda _event: self._on_language_changed())
+        ttk.Checkbutton(grid, text=t("autostart_check", lang), variable=self.autostart).grid(
+            row=4, column=0, columnspan=2, sticky="w"
         )
 
-        self.config_label = ttk.Label(frame, text=f"設定ファイル: {self.config_path}")
+        self.config_label = ttk.Label(frame, text=t("config_label", lang, path=self.config_path))
         self.config_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
         picker = ttk.Frame(frame)
         picker.grid(row=2, column=0, sticky="w")
-        ttk.Button(picker, text="設定を開く", command=self._open_config).pack(side="left", padx=6)
+        ttk.Button(picker, text=t("open_config", lang), command=self._open_config).pack(side="left", padx=6)
 
         self.tree = ttk.Treeview(
             frame, columns=("model_name", "model", "api_key", "api_base"), show="headings", height=7
         )
-        for column, title, width in (
-            ("model_name", "モデル名", 160),
-            ("model", "プロバイダ側モデル", 220),
-            ("api_key", "API キー", 200),
-            ("api_base", "ベース URL", 220),
+        for column, title_key, width in (
+            ("model_name", "col_model_name", 160),
+            ("model", "col_model", 220),
+            ("api_key", "col_api_key", 200),
+            ("api_base", "col_api_base", 220),
         ):
-            self.tree.heading(column, text=title)
+            self.tree.heading(column, text=t(title_key, lang))
             self.tree.column(column, width=width)
         self.tree.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
 
         rows = ttk.Frame(frame)
         rows.grid(row=4, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(rows, text="モデルを追加", command=self._add_row).pack(side="left")
-        ttk.Button(rows, text="選択を削除", command=self._delete_row).pack(side="left", padx=6)
-        ttk.Button(rows, text="保存", command=self._save_rows).pack(side="left")
+        ttk.Button(rows, text=t("add_model", lang), command=self._add_row).pack(side="left")
+        ttk.Button(rows, text=t("delete_selected", lang), command=self._delete_row).pack(side="left", padx=6)
+        ttk.Button(rows, text=t("save", lang), command=self._save_rows).pack(side="left")
 
         ttk.Label(frame, textvariable=self.status).grid(row=5, column=0, sticky="w", pady=(8, 0))
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(buttons, text="保存して起動", command=self.start).pack(side="left")
-        ttk.Button(buttons, text="停止", command=self.stop).pack(side="left", padx=6)
-        ttk.Button(buttons, text="ログを開く", command=self._open_log).pack(side="left")
+        ttk.Button(buttons, text=t("save_and_start", lang), command=self.start).pack(side="left")
+        ttk.Button(buttons, text=t("stop", lang), command=self.stop).pack(side="left", padx=6)
+        ttk.Button(buttons, text=t("open_log", lang), command=self._open_log).pack(side="left")
+
+    def _on_language_changed(self) -> None:
+        lang = self.language.get()
+        if lang not in LANGUAGES:
+            return
+        self.lang = lang
+        self.root.title(t("app_title", lang))
+        self._refresh_rows()
+        self.status.set(t("status_stopped", lang))
 
     def _refresh_rows(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -474,8 +491,9 @@ class Launcher:
             self.tree.insert("", "end", values=(row.model_name, row.model, display, row.api_base))
 
     def _add_row(self) -> None:
+        lang = self.lang
         window = tk.Toplevel(self.root)
-        window.title("モデルを追加")
+        window.title(t("add_window_title", lang))
         window.transient(self.root)
 
         provider = tk.StringVar(value="gemini")
@@ -483,10 +501,10 @@ class Launcher:
         provider_model = tk.StringVar()
         api_key = tk.StringVar()
         base_url = tk.StringVar(value="http://127.0.0.1:1234/v1")
-        hint = tk.StringVar(value="キーを入れて「モデル一覧を取得」を押すと、モデル名に候補が出ます")
+        hint = tk.StringVar(value=t("hint_fetch", lang))
 
-        ttk.Label(window, text="プロバイダ").grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        provider_box = ttk.Combobox(window, textvariable=provider, values=PROVIDERS, width=20, state="readonly")
+        ttk.Label(window, text=t("label_provider", lang)).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        provider_box = ttk.Combobox(window, textvariable=provider, values=[provider_display_name(p, lang) for p in PROVIDERS], width=20, state="readonly")
         provider_box.grid(row=0, column=1, sticky="w", padx=8, pady=4)
 
         key_row = ttk.Frame(window)
@@ -494,24 +512,31 @@ class Launcher:
         url_row = ttk.Frame(window)
         url_row.grid(row=1, column=1, sticky="w")
         url_entry = ttk.Entry(url_row, textvariable=base_url, width=36)
-        ttk.Label(window, text="ベース URL").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(window, text=t("label_base_url", lang)).grid(row=1, column=0, sticky="w", padx=8, pady=4)
+
+        def provider_key(label: str) -> str:
+            for p in PROVIDERS:
+                if provider_display_name(p, lang) == label:
+                    return p
+            return label
 
         def show_provider_fields() -> None:
-            if provider.get() == LOCAL_PROVIDER:
+            key = provider_key(provider.get())
+            if key == LOCAL_PROVIDER:
                 url_entry.grid(row=0, column=0)
-                hint.set("LM Studio / Ollama / vLLM などの URL です。鍵を要求しないサーバーは空のままにできます")
+                hint.set(t("hint_local", lang))
             else:
                 url_entry.grid_forget()
-                hint.set("キーを入れて「モデル一覧を取得」を押すと、モデル名に候補が出ます")
+                hint.set(t("hint_fetch", lang))
 
         provider_box.bind("<<ComboboxSelected>>", lambda _event: show_provider_fields())
 
         ttk.Entry(key_row, textvariable=api_key, width=36).pack(side="left")
         fetch_button = ttk.Button(
             key_row,
-            text="モデル一覧を取得",
+            text=t("fetch_models", lang),
             command=lambda: self._fill_models(
-                provider.get(),
+                provider_key(provider.get()),
                 api_key.get().strip(),
                 base_url.get().strip(),
                 fetch_button,
@@ -520,17 +545,18 @@ class Launcher:
             ),
         )
         fetch_button.pack(side="left", padx=4)
-        ttk.Label(window, text="API キー").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(window, text=t("label_api_key", lang)).grid(row=2, column=0, sticky="w", padx=8, pady=4)
 
-        ttk.Label(window, text="モデル名").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(window, text=t("label_name", lang)).grid(row=3, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(window, textvariable=name, width=48).grid(row=3, column=1, sticky="w", padx=8, pady=4)
 
-        ttk.Label(window, text="プロバイダ側モデル").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(window, text=t("label_provider_model", lang)).grid(row=4, column=0, sticky="w", padx=8, pady=4)
         model_box = ttk.Combobox(window, textvariable=provider_model, width=48)
         model_box.grid(row=4, column=1, sticky="w", padx=8, pady=4)
 
         status = ttk.Label(window, textvariable=hint)
         status.grid(row=5, column=1, sticky="w", padx=8)
+        provider.set(provider_display_name("gemini", lang))
         show_provider_fields()
 
         def commit() -> None:
@@ -538,20 +564,21 @@ class Launcher:
             provider_model_name: Final = provider_model.get().strip()
             key: Final = api_key.get().strip()
             if not model_name or not provider_model_name:
-                messagebox.showerror("入力", "モデル名とプロバイダ側モデルは必須です", parent=window)
+                messagebox.showerror(t("key_input_title", lang), t("error_required", lang), parent=window)
                 return
-            local: Final = provider.get() == LOCAL_PROVIDER
+            local: Final = provider_key(provider.get()) == LOCAL_PROVIDER
             try:
                 row = (
-                    local_deployment(model_name, provider_model_name, key, base_url.get())
+                    local_deployment(model_name, provider_model_name, key, base_url.get(), lang)
                     if local
                     else Deployment(model_name, provider_model_name, key)
                 )
             except ValueError as error:
-                messagebox.showerror("ベース URL", str(error), parent=window)
+                messagebox.showerror(t("label_base_url", lang), str(error), parent=window)
                 return
-            if not local and provider.get() in ("gemini", "openai", "anthropic"):
-                prefix = f"{provider.get()}/"
+            prov_key = provider_key(provider.get())
+            if not local and prov_key in ("gemini", "openai", "anthropic"):
+                prefix = f"{prov_key}/"
                 if not row.model.startswith(prefix):
                     row = Deployment(row.model_name, f"{prefix}{row.model}", row.api_key, row.api_base)
             rows = read_deployments(self.config_path)
@@ -559,7 +586,7 @@ class Launcher:
             window.destroy()
             self._refresh_rows()
 
-        ttk.Button(window, text="追加", command=commit).grid(row=6, column=1, sticky="e", padx=8, pady=8)
+        ttk.Button(window, text=t("add", lang), command=commit).grid(row=6, column=1, sticky="e", padx=8, pady=8)
 
     def _fill_models(
         self,
@@ -570,37 +597,39 @@ class Launcher:
         hint: tk.StringVar,
         model_box: ttk.Combobox,
     ) -> None:
+        lang = self.lang
         if not api_key and provider != LOCAL_PROVIDER:
-            hint.set("API キーを入力してください")
+            hint.set(t("error_key_required", lang))
             return
         if provider == LOCAL_PROVIDER and not base_url:
-            hint.set("ベース URL を入力してください")
+            hint.set(t("error_url_required", lang))
             return
         button.state(["disabled"])
-        hint.set("モデル一覧を取得しています...")
+        hint.set(t("hint_fetching", lang))
 
         def done() -> None:
             button.state(["!disabled"])
 
         def worker() -> None:
             try:
-                models = fetch_provider_models(provider, api_key, base_url)
+                models = fetch_provider_models(provider, api_key, base_url, lang)
             except Exception as error:
-                message = f"取得に失敗しました: {type(error).__name__}: {error}"
+                message = t("fetch_fail", lang, message=f"{type(error).__name__}: {error}")
                 self.root.after(0, lambda: hint.set(message))
                 self.root.after(0, done)
                 return
             names = tuple(m.split("/", 1)[1] for m in models)
             self.root.after(0, done)
-            self.root.after(0, lambda: hint.set(f"{len(names)} 件取得しました。入力欄から選べます"))
+            self.root.after(0, lambda: hint.set(t("fetch_success", lang, count=len(names))))
             self.root.after(0, lambda: model_box.configure(values=names))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _delete_row(self) -> None:
+        lang = self.lang
         selected = self.tree.selection()
         if not selected:
-            messagebox.showinfo("削除", "削除する行を選択してください")
+            messagebox.showinfo(t("delete_title", lang), t("error_delete_select", lang))
             return
         all_rows = read_deployments(self.config_path)
         positions = {self.tree.index(item) for item in selected}
@@ -609,7 +638,7 @@ class Launcher:
 
     def _save_rows(self) -> None:
         self._refresh_rows()
-        self.status.set("モデル設定を保存しました")
+        self.status.set(t("status_saved", self.lang))
 
     def _open_config(self) -> None:
         if self.config_path and self.config_path.is_file():
@@ -620,53 +649,57 @@ class Launcher:
             os.startfile(str(self.log_path))
 
     def _validated_settings(self) -> Settings | None:
+        lang = self.lang
         try:
             port = int(self.port.get())
         except ValueError:
-            messagebox.showerror("ポート", "ポートは数値で入力してください")
+            messagebox.showerror(t("port_title", lang), t("error_port_number", lang))
             return None
         if not 1 <= port <= 65535:
-            messagebox.showerror("ポート", "ポートは 1 から 65535 の範囲で入力してください")
+            messagebox.showerror(t("port_title", lang), t("error_port_range", lang))
             return None
         return Settings(
             host=self.host.get().strip() or "127.0.0.1",
             port=port,
             master_key=self.master_key.get().strip(),
+            language=lang,
         )
 
     def start(self) -> None:
+        lang = self.lang
         if self.process.running():
-            self.status.set("すでに起動しています")
+            self.status.set(t("status_already_running", lang))
             return
         settings = self._validated_settings()
         if settings is None:
             return
         if not settings.master_key:
-            messagebox.showwarning("マスターキー", unauthenticated_warning(settings.host))
+            messagebox.showwarning(t("master_key_title", lang), unauthenticated_warning(settings.host, lang))
         settings.save(self.config_path)
         set_autostart(self.autostart.get())
         try:
             self.process.start(self.config_path, settings, self.log_path)
         except (OSError, RuntimeError) as error:
-            messagebox.showerror("起動失敗", str(error))
+            messagebox.showerror(t("error_start_failed", lang), str(error))
             return
-        self.status.set(f"起動中 http://{settings.host}:{settings.port}/  ログ: {LOG_NAME}")
+        self.status.set(t("status_starting", lang, host=settings.host, port=settings.port, log=LOG_NAME))
         threading.Thread(target=self._watch_startup, args=(settings.port,), daemon=True).start()
 
     def _watch_startup(self, port: int) -> None:
+        lang = self.lang
         for _ in range(90):
             if health_ok(port):
-                self.status.set(f"稼働中 http://127.0.0.1:{port}/")
+                self.status.set(t("status_running", lang, port=port))
                 return
             if not self.process.running():
-                self.status.set(f"起動に失敗しました。{LOG_NAME} を確認してください")
+                self.status.set(t("status_failed", lang, log=LOG_NAME))
                 return
             threading.Event().wait(2)
-        self.status.set("起動を確認できません。ログを確認してください")
+        self.status.set(t("status_failed_check", lang))
 
     def stop(self) -> None:
         self.process.stop()
-        self.status.set("停止中")
+        self.status.set(t("status_stopped", self.lang))
 
     def hide(self) -> None:
         if not self._ensure_tray():
@@ -687,13 +720,14 @@ class Launcher:
             return False
         image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
         ImageDraw.Draw(image).ellipse((6, 6, 26, 26), fill=(37, 99, 235, 255))
+        lang = self.lang
         menu = pystray.Menu(
-            pystray.MenuItem("表示", lambda: self.show(), default=True),
-            pystray.MenuItem("起動", lambda: self.root.after(0, self.start)),
-            pystray.MenuItem("停止", lambda: self.root.after(0, self.stop)),
-            pystray.MenuItem("終了", lambda: self.quit()),
+            pystray.MenuItem(t("tray_show", lang), lambda: self.show(), default=True),
+            pystray.MenuItem(t("tray_start", lang), lambda: self.root.after(0, self.start)),
+            pystray.MenuItem(t("tray_stop", lang), lambda: self.root.after(0, self.stop)),
+            pystray.MenuItem(t("tray_quit", lang), lambda: self.quit()),
         )
-        self.tray = pystray.Icon("LiteLLM Proxy", image, "LiteLLM Proxy", menu)
+        self.tray = pystray.Icon(t("tray_title", lang), image, t("tray_title", lang), menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
         return True
 
@@ -716,7 +750,7 @@ def run_headless() -> int:
     settings: Final = Settings.load(config)
     log_path: Final = base / LOG_NAME
     if not settings.master_key:
-        append_log_line(log_path, unauthenticated_warning(settings.host))
+        append_log_line(log_path, unauthenticated_warning(settings.host, settings.language))
     process = ProxyProcess()
     process.start(config, settings, log_path)
     try:
@@ -731,8 +765,8 @@ def main() -> int:
     import multiprocessing
 
     multiprocessing.freeze_support()
-    parser = argparse.ArgumentParser(description="LiteLLM Proxy Windows ランチャー")
-    parser.add_argument("--headless", action="store_true", help="GUI なしで保存済み設定を使い起動する")
+    parser = argparse.ArgumentParser(description=t("headless_description", DEFAULT_LANGUAGE))
+    parser.add_argument("--headless", action="store_true", help=t("headless_help", DEFAULT_LANGUAGE))
     args: Final = parser.parse_args()
     if args.headless:
         return run_headless()
