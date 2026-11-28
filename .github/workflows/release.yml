@@ -1,0 +1,46 @@
+name: Release LiteLLMTray
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Create venv and install dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\python.exe -m pip install -e ".[proxy]" pystray pillow pyinstaller
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          .venv\Scripts\python.exe -m PyInstaller --noconfirm --distpath . windows_launcher\LiteLLMTray.spec
+
+      - name: Verify exe exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path LiteLLMTray.exe)) { throw "LiteLLMTray.exe was not produced" }
+          Get-Item LiteLLMTray.exe | Select-Object Name, Length
+
+      - name: Create release and upload exe
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" LiteLLMTray.exe --title "${{ github.ref_name }}" --generate-release-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
